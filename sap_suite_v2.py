@@ -283,8 +283,13 @@ def github_push(cfg, dosya_yolu=None):
         with urllib.request.urlopen(req, timeout=15) as r:
             mevcut = _json.loads(r.read())
         sha = mevcut.get("sha", "")
+        if not sha:
+            return False, f"SHA bos. Repo:{repo} Dosya:{fname}"
+    except urllib.error.HTTPError as e:
+        hata = e.read().decode()[:200]
+        return False, f"SHA HTTP {e.code}\nRepo:{repo}\nDosya:{fname}\n{hata}"
     except Exception as e:
-        return False, f"SHA alinamadi: {e}"
+        return False, f"SHA alinamadi: {e}\nRepo:{repo} Dosya:{fname}"
     # PUT ile guncelle
     payload = _json.dumps({
         "message": "SAP Suite v2 guncellendi (otomatik)",
@@ -1438,20 +1443,26 @@ class AlanTanitmaSekmesi(QWidget):
         except Exception as e:
             QMessageBox.critical(self,"Hata",str(e))
 
+    def _github_push(self):
+        try:
+            cfg = load_config()
+            token = cfg.get("github_token","").strip()
+            if not token:
+                QMessageBox.warning(self,"GitHub","Token girilmemiş!\nAyarlar → GitHub Entegrasyonu → Token alanını doldurun.")
+                return
+            ok, mesaj = github_push(cfg)
+            if ok:
+                QMessageBox.information(self, "GitHub ✓", mesaj)
+            else:
+                QMessageBox.critical(self, "GitHub Hata", mesaj)
+        except Exception as e:
+            QMessageBox.critical(self, "GitHub Hata", f"Beklenmeyen hata:\n{e}")
+
 # ── İndirici Worker ───────────────────────────────────────────────────────────
 class IndiriciWorker(QThread):
     log_signal   = pyqtSignal(str)
     bitti_signal = pyqtSignal(dict)
     ilerleme     = pyqtSignal(int, int)
-
-    def _github_push(self):
-        self._ayar_kaydet(sessiz=True)
-        ok, mesaj = github_push(self.cfg)
-        if ok:
-            QMessageBox.information(self, "GitHub", mesaj)
-        else:
-            QMessageBox.critical(self, "GitHub Hata", mesaj)
-
 
     def __init__(self, cfg, sayfalar, numbers):
         super().__init__()
