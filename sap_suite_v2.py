@@ -143,6 +143,9 @@ DEFAULT_CONFIG = {
     "akis_json": str(AKIS_FILE),
     "akis_json_excel": "",
     "akis_json_pdf":   "",
+    "github_token":    "",
+    "github_repo":     "Elcihad/Cloude",
+    "github_file":     "sap_suite_v2.py",
     "mail_konu_filtre":     "Doğrulama Kodu",
     "mail_gonderen_filtre": "",
     "mail_klasor_yolu":     "Doğrulama",
@@ -248,6 +251,55 @@ def mail_den_kod_oku(cfg, timeout=60):
         pass  # Outlook acik degil vs.
 
     return None  # Outlook bulunamadi veya kod gelmedi
+
+
+def github_push(cfg, dosya_yolu=None):
+    """Mevcut sap_suite_v2.py dosyasini GitHub'a pushlar."""
+    import urllib.request, base64, json as _json
+    token = cfg.get("github_token", "").strip()
+    repo  = cfg.get("github_repo",  "Elcihad/Cloude").strip()
+    fname = cfg.get("github_file",  "sap_suite_v2.py").strip()
+    if not token:
+        return False, "GitHub token ayarlanmamis!"
+    # Kaynak dosya: bu scriptin kendisi
+    if dosya_yolu is None:
+        dosya_yolu = __file__
+    try:
+        with open(dosya_yolu, 'rb') as f:
+            icerik = f.read()
+    except Exception as e:
+        return False, f"Dosya okunamadi: {e}"
+    b64 = base64.b64encode(icerik).decode('ascii')
+    api_url = f"https://api.github.com/repos/{repo}/contents/{fname}"
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json',
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'SAP-Suite-v2'
+    }
+    # Mevcut SHA'yi al
+    try:
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            mevcut = _json.loads(r.read())
+        sha = mevcut.get("sha", "")
+    except Exception as e:
+        return False, f"SHA alinamadi: {e}"
+    # PUT ile guncelle
+    payload = _json.dumps({
+        "message": "SAP Suite v2 guncellendi (otomatik)",
+        "content": b64,
+        "sha": sha
+    }).encode('utf-8')
+    try:
+        req = urllib.request.Request(api_url, data=payload, method='PUT', headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            _json.loads(r.read())
+        return True, "GitHub'a basariyla yuklendi!"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}: {e.read().decode()[:200]}"
+    except Exception as e:
+        return False, f"Hata: {e}"
 
 
 def load_config():
@@ -1141,6 +1193,8 @@ class AlanTanitmaSekmesi(QWidget):
         btn_kaydet.clicked.connect(self._json_kaydet); alt.addWidget(btn_kaydet)
         btn_yukle = QPushButton("📥  JSON Yükle"); btn_yukle.clicked.connect(self._json_yukle)
         alt.addWidget(btn_yukle)
+        btn_github = QPushButton("🐙  GitHub'a Gönder"); btn_github.clicked.connect(self._github_push)
+        alt.addWidget(btn_github)
         ov.addLayout(alt); ana.addWidget(orta)
 
         # ── Sağ panel: Excel / PDF sekmeleri ──────────────────────────────
@@ -1389,6 +1443,15 @@ class IndiriciWorker(QThread):
     log_signal   = pyqtSignal(str)
     bitti_signal = pyqtSignal(dict)
     ilerleme     = pyqtSignal(int, int)
+
+    def _github_push(self):
+        self._ayar_kaydet(sessiz=True)
+        ok, mesaj = github_push(self.cfg)
+        if ok:
+            QMessageBox.information(self, "GitHub", mesaj)
+        else:
+            QMessageBox.critical(self, "GitHub Hata", mesaj)
+
 
     def __init__(self, cfg, sayfalar, numbers):
         super().__init__()
@@ -1748,6 +1811,87 @@ class IndiriciWorker(QThread):
         self.bitti_signal.emit(res)
 
 # ── Sekme 2: Otomatik İndirici ────────────────────────────────────────────────
+class IsYeriFiltreDlg(QDialog):
+    def __init__(self,is_yerleri,parent=None):
+        super().__init__(parent); self.setWindowTitle("Is Yeri Filtresi")
+        self.setMinimumSize(380,420); self.setStyleSheet(SS)
+        self._is_yerleri=sorted(is_yerleri); self._kur()
+    def _kur(self):
+        lay=QVBoxLayout(self); lay.setSpacing(8); lay.setContentsMargins(16,16,16,16)
+        b=QLabel("Hangi is yerleri dahil edilsin?"); b.setStyleSheet(f"color:{C['accent']};font-weight:bold;font-size:13px;"); lay.addWidget(b)
+        bl=QHBoxLayout()
+        bh=QPushButton("Tumunu Sec"); bh.clicked.connect(self._hepsini_sec); bl.addWidget(bh)
+        bk=QPushButton("Tumunu Kaldir"); bk.clicked.connect(self._hepsini_kaldir); bl.addWidget(bk)
+        lay.addLayout(bl)
+        self.liste=QListWidget(); self.liste.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        for iy in self._is_yerleri:
+            it=QListWidgetItem(iy); it.setSelected(True); self.liste.addItem(it)
+        lay.addWidget(self.liste)
+        bb=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("Uygula"); bb.button(QDialogButtonBox.StandardButton.Ok).setObjectName("accent")
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject); lay.addWidget(bb)
+    def _hepsini_sec(self):
+        for i in range(self.liste.count()): self.liste.item(i).setSelected(True)
+    def _hepsini_kaldir(self):
+        for i in range(self.liste.count()): self.liste.item(i).setSelected(False)
+    def secili_is_yerleri(self):
+        return [self.liste.item(i).text() for i in range(self.liste.count()) if self.liste.item(i).isSelected()]
+
+class HaftalikOnizlemeDlg(QDialog):
+    def __init__(self,benzersiz_liste,dosya_yolu,dl_dir,parent=None):
+        super().__init__(parent); self.setWindowTitle("Haftalik Program - Onizleme")
+        self.setMinimumSize(540,560); self.setStyleSheet(SS)
+        self._liste=list(benzersiz_liste); self._dosya=dosya_yolu
+        self._dl_dir=dl_dir; self._inmis=set(); self._inmisleri_gizle=True; self._kur()
+    def _zaten_indi_mi(self,numara):
+        if not self._dl_dir: return False
+        dl=Path(self._dl_dir)
+        if not dl.exists(): return False
+        for f in dl.iterdir():
+            if f.stem.split("_")[0]==str(numara): return True
+        return False
+    def _kur(self):
+        lay=QVBoxLayout(self); lay.setSpacing(8); lay.setContentsMargins(16,16,16,16)
+        b=QLabel(f"Dosya: {Path(self._dosya).name}"); b.setStyleSheet(f"color:{C['accent']};font-weight:bold;font-size:13px;"); b.setWordWrap(True); lay.addWidget(b)
+        self.ozet_lbl=QLabel(); self.ozet_lbl.setStyleSheet(f"color:{C['text']};font-size:12px;"); lay.addWidget(self.ozet_lbl)
+        self.liste_widget=QListWidget(); self.liste_widget.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        lay.addWidget(self.liste_widget); self._listeyi_doldur()
+        bl=QHBoxLayout()
+        bs=QPushButton("Secilileri Cikar"); bs.setObjectName("danger"); bs.clicked.connect(self._secilileri_sil); bl.addWidget(bs)
+        bt=QPushButton("Inmisleri Goster/Gizle"); bt.clicked.connect(self._inmisleri_toggle); bl.addWidget(bt)
+        bl.addStretch(); lay.addLayout(bl)
+        bb=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("Indirmeye Basla"); bb.button(QDialogButtonBox.StandardButton.Ok).setObjectName("accent")
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject); lay.addWidget(bb); self._ozet_guncelle()
+    def _listeyi_doldur(self):
+        self.liste_widget.clear(); self._inmis.clear()
+        for numara in self._liste:
+            indi=self._zaten_indi_mi(numara)
+            if indi: self._inmis.add(numara)
+            if indi and self._inmisleri_gizle: continue
+            item=QListWidgetItem()
+            if indi:
+                item.setText(f"  {numara}"); item.setForeground(QColor(C["dim"]))
+                f=item.font(); f.setStrikeOut(True); item.setFont(f)
+            else:
+                item.setText(f"  {numara}"); item.setForeground(QColor(C["text"]))
+            self.liste_widget.addItem(item)
+    def _ozet_guncelle(self):
+        toplam=len(self._liste); inmis=len(self._inmis); bekleyen=toplam-inmis
+        ra=C["accent"]; rd=C["dim"]
+        self.ozet_lbl.setText(f"Toplam: <b>{toplam}</b>  |  <span style='color:{ra}'>Indirilecek: <b>{bekleyen}</b></span>  |  <span style='color:{rd}'>Zaten inmis: <b>{inmis}</b></span>")
+        self.ozet_lbl.setTextFormat(Qt.TextFormat.RichText)
+    def _secilileri_sil(self):
+        for item in self.liste_widget.selectedItems():
+            numara=item.text().strip()
+            if numara in self._liste: self._liste.remove(numara)
+            self._inmis.discard(numara); self.liste_widget.takeItem(self.liste_widget.row(item))
+        self._ozet_guncelle()
+    def _inmisleri_toggle(self):
+        self._inmisleri_gizle=not self._inmisleri_gizle; self._listeyi_doldur(); self._ozet_guncelle()
+    def secili_liste(self):
+        return [n for n in self._liste if n not in self._inmis]
+
 class IndiriciSekmesi(QWidget):
     def __init__(self, cfg):
         super().__init__()
@@ -1777,6 +1921,21 @@ class IndiriciSekmesi(QWidget):
         self.fa2_chk.setChecked(self.cfg.get("2fa_gerekli",False)); v1.addWidget(self.fa2_chk)
         sv.addWidget(gb1)
 
+        # GitHub
+        gb_gh = QGroupBox("GitHub Entegrasyonu")
+        vg = QVBoxLayout(gb_gh); vg.setSpacing(6)
+        vg.addWidget(QLabel("Personal Access Token:"))
+        self.github_token_edit = QLineEdit(self.cfg.get("github_token",""))
+        self.github_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.github_token_edit.setPlaceholderText("github_pat_...")
+        vg.addWidget(self.github_token_edit)
+        gh_repo_lay = QHBoxLayout()
+        gh_repo_lay.addWidget(QLabel("Repo:"))
+        self.github_repo_edit = QLineEdit(self.cfg.get("github_repo","Elcihad/Cloude"))
+        gh_repo_lay.addWidget(self.github_repo_edit)
+        vg.addLayout(gh_repo_lay)
+        sv.addWidget(gb_gh)
+
         # Mail 2FA — Outlook
         gb_mail = QGroupBox("Mail 2FA — Outlook")
         vm = QVBoxLayout(gb_mail); vm.setSpacing(6)
@@ -1803,11 +1962,12 @@ class IndiriciSekmesi(QWidget):
         # Excel Ayarları
         gb2 = QGroupBox("Excel Ayarları")
         v2 = QVBoxLayout(gb2); v2.setSpacing(6)
-        v2.addWidget(QLabel("Excel dosyası:"))
-        ef = QHBoxLayout(); self.excel_edit = QLineEdit(self.cfg.get("excel_file",""))
+        v2.addWidget(QLabel("Haftalik Program:"))
+        ef=QHBoxLayout(); self.excel_edit=QLineEdit(self.cfg.get("excel_file",""))
         ef.addWidget(self.excel_edit)
-        btn_excel = QPushButton("..."); btn_excel.setFixedWidth(36)
-        btn_excel.clicked.connect(self._sec_excel); ef.addWidget(btn_excel); v2.addLayout(ef)
+        bxs=QPushButton("..."); bxs.setFixedWidth(36); bxs.clicked.connect(self._sec_excel); ef.addWidget(bxs)
+        bxr=QPushButton("x"); bxr.setFixedWidth(28); bxr.setObjectName("danger"); bxr.clicked.connect(self._excel_sifirla); ef.addWidget(bxr)
+        v2.addLayout(ef)
 
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Sayfa:"))
@@ -1932,12 +2092,58 @@ class IndiriciSekmesi(QWidget):
         btn_lay.addWidget(btn_log_temizle); sagv.addLayout(btn_lay); ana.addWidget(sag)
 
     def _sec_excel(self):
-        x,_=QFileDialog.getOpenFileName(self,"Excel",self.excel_edit.text(),"Excel (*.xlsx *.xls)")
-        if x: self.excel_edit.setText(x)
-
+        x,_=QFileDialog.getOpenFileName(self,"Haftalik Program Sec",self.excel_edit.text(),"Excel (*.xlsx *.xls)")
+        if not x: return
+        self.excel_edit.setText(x); self._haftalik_onizle(x)
+    def _excel_sifirla(self):
+        if QMessageBox.question(self,"Sifirla","Excel listesi temizlensin mi?",
+            QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No)==QMessageBox.StandardButton.Yes:
+            self.excel_edit.setText(""); self.cfg["excel_file"]=""; save_config(self.cfg)
+    @staticmethod
+    def _col_idx(h):
+        i=0
+        for c in h.upper(): i=i*26+(ord(c)-ord("A")+1)
+        return i-1
+    def _excel_oku_filtreli(self,dosya_yolu):
+        import pandas as pd
+        df=pd.read_excel(dosya_yolu,sheet_name=self.sheet_spin.value(),header=0,dtype=str)
+        df.dropna(how="all",inplace=True)
+        siparis_col=df.iloc[:,self._col_idx(self.sutun_edit.text().strip().upper() or "C")]
+        try:
+            is_yeri_col=df.iloc[:,11]
+            is_yerleri=sorted([x for x in is_yeri_col.dropna().unique() if str(x).strip()])
+        except Exception:
+            is_yerleri=[]
+        if is_yerleri:
+            fdlg=IsYeriFiltreDlg(is_yerleri,self)
+            if not fdlg.exec(): return None,is_yerleri
+            secili=fdlg.secili_is_yerleri()
+            if not secili:
+                QMessageBox.warning(self,"Filtre","En az bir is yeri secin!"); return None,is_yerleri
+            siparis_listesi=siparis_col[is_yeri_col.isin(secili)]
+        else:
+            siparis_listesi=siparis_col
+        ham=[]
+        for raw in siparis_listesi:
+            val=str(raw).strip().split(".")[0]
+            if val not in ("","nan","NaN","None"): ham.append(val)
+        return list(dict.fromkeys(ham)),is_yerleri
+    def _haftalik_onizle(self,dosya_yolu,mod="excel"):
+        try:
+            benzersiz,_=self._excel_oku_filtreli(dosya_yolu)
+            if benzersiz is None: return
+            if not benzersiz:
+                QMessageBox.warning(self,"Bos","Secili is yerlerinde siparis bulunamadi!"); return
+            dl_dir=self.pdf_dl_edit.text().strip() if mod=="pdf" else self.dl_edit.text().strip()
+            HaftalikOnizlemeDlg(benzersiz,dosya_yolu,dl_dir,self).exec()
+        except Exception as e:
+            QMessageBox.critical(self,"Hata",f"Excel okunamadi:\n{e}")
     def _sec_dl(self):
-        x=QFileDialog.getExistingDirectory(self,"Klasör",self.dl_edit.text())
+        x=QFileDialog.getExistingDirectory(self,"Excel Indirme",self.dl_edit.text())
         if x: self.dl_edit.setText(x)
+    def _sec_pdf_dl(self):
+        x=QFileDialog.getExistingDirectory(self,"PDF Indirme",self.pdf_dl_edit.text())
+        if x: self.pdf_dl_edit.setText(x)
 
     def _mail_test(self):
         """Outlook bağlantısını test et — alt klasörü de kontrol eder."""
@@ -2000,6 +2206,8 @@ class IndiriciSekmesi(QWidget):
     def _ayar_kaydet(self, sessiz=False):
         self.cfg.update({
             "sap_url":          self.url_edit.text().strip(),
+            "github_token":    self.github_token_edit.text().strip() if hasattr(self,"github_token_edit") else self.cfg.get("github_token",""),
+            "github_repo":     self.github_repo_edit.text().strip() if hasattr(self,"github_repo_edit") else self.cfg.get("github_repo","Elcihad/Cloude"),
             "username":         self.user_edit.text().strip(),
             "password":         self.pass_edit.text(),
             "2fa_gerekli":      self.fa2_chk.isChecked(),
@@ -2029,67 +2237,56 @@ class IndiriciSekmesi(QWidget):
         self.log_edit.append(msg)
         self.log_edit.moveCursor(QTextCursor.MoveOperation.End)
 
-    def _baslat(self, mod="excel"):
+    def _baslat(self,mod="excel"):
         self._ayar_kaydet(sessiz=True)
-        # Moda göre doğru JSON'u seç
-        anahtar = "akis_json_excel" if mod == "excel" else "akis_json_pdf"
-        etiket  = "Excel" if mod == "excel" else "PDF"
-        akis_json = self.cfg.get(anahtar,"")
+        anahtar="akis_json_excel" if mod=="excel" else "akis_json_pdf"
+        etiket="Excel" if mod=="excel" else "PDF"
+        akis_json=self.cfg.get(anahtar,"")
         if not akis_json or not os.path.exists(akis_json):
-            QMessageBox.warning(self,"Eksik",
-                f"{etiket} akış JSON seçilmedi!\n"
-                "Alan Tanıtma sekmesinde JSON kaydedip buradan seçin.")
-            return
+            QMessageBox.warning(self,"Eksik",f"{etiket} akis JSON secilmedi!"); return
         try:
-            veri = json.loads(Path(akis_json).read_text(encoding="utf-8"))
-            sayfalar = veri.get("sayfalar",[])
+            veri=json.loads(Path(akis_json).read_text(encoding="utf-8")); sayfalar=veri.get("sayfalar",[])
         except Exception as e:
-            QMessageBox.critical(self,"Hata",f"JSON okunamadı:\n{e}"); return
+            QMessageBox.critical(self,"Hata",f"JSON okunamadi:\n{e}"); return
         if not sayfalar:
-            QMessageBox.warning(self,"Boş",f"{etiket} akış JSON'da sayfa bulunamadı!"); return
-        self._log(f"── {'📊' if mod=='excel' else '📄'} {etiket} modu başlatılıyor ──")
-
-        # Excel yükle
-        excel = self.cfg.get("excel_file","")
+            QMessageBox.warning(self,"Bos","Akis JSON'da sayfa bulunamadi!"); return
+        excel=self.cfg.get("excel_file","")
         if not excel or not os.path.exists(excel):
-            QMessageBox.warning(self,"Eksik","Excel dosyası seçilmedi!"); return
+            QMessageBox.warning(self,"Eksik","Excel dosyasi secilmedi!"); return
         try:
-            import pandas as pd
-            sutun = self.cfg["numara_sutun"]; satir = self.cfg["numara_baslangic_satir"]
-            def col_idx(h):
-                i=0
-                for c in h.upper(): i=i*26+(ord(c)-ord("A")+1)
-                return i-1
-            df = pd.read_excel(excel, sheet_name=self.cfg["excel_sheet"], header=None, dtype=str)
-            df = df.iloc[satir-1:]; df.dropna(how="all", inplace=True)
-            numbers = []
-            for raw in df.iloc[:,col_idx(sutun)]:
-                val=str(raw).strip().split(".")[0]
-                if val not in ("","nan","NaN","None"): numbers.append(val)
+            benzersiz,_=self._excel_oku_filtreli(excel)
+            if benzersiz is None: return
         except Exception as e:
-            QMessageBox.critical(self,"Hata",f"Excel okunamadı:\n{e}"); return
+            QMessageBox.critical(self,"Hata",f"Excel okunamadi:\n{e}"); return
+        if not benzersiz:
+            QMessageBox.warning(self,"Bos","Secili is yerlerinde siparis bulunamadi!"); return
+        dl_dir=self.cfg.get("pdf_download_folder","") if mod=="pdf" else self.cfg.get("download_folder","")
+        onizleme=HaftalikOnizlemeDlg(benzersiz,excel,dl_dir,self)
+        if not onizleme.exec(): return
+        numbers=onizleme.secili_liste()
         if not numbers:
-            QMessageBox.warning(self,"Boş","Excel'de numara bulunamadı!"); return
-
-        self.progress.setMaximum(len(numbers)); self.progress.setValue(0)
-        self.ilerleme_lbl.setText(f"0/{len(numbers)}")
+            QMessageBox.information(self,"Bilgi","Tum siparisler zaten inmis."); return
+        self._log(f"── {'📊' if mod=='excel' else '📄'} {etiket} — {len(numbers)} siparis ──")
+        self.progress.setMaximum(len(numbers)); self.progress.setValue(0); self.ilerleme_lbl.setText(f"0/{len(numbers)}")
         self.btn_excel.setEnabled(False); self.btn_pdf.setEnabled(False); self.btn_dur.setEnabled(True)
-
-        self._worker = IndiriciWorker(self.cfg, sayfalar, numbers)
+        cfg_w=dict(self.cfg)
+        if mod=="pdf" and dl_dir: cfg_w["download_folder"]=dl_dir
+        self._worker=IndiriciWorker(cfg_w,sayfalar,numbers)
         self._worker.log_signal.connect(self._log)
-        self._worker.ilerleme.connect(lambda d,t: (self.progress.setValue(d), self.ilerleme_lbl.setText(f"{d}/{t}")))
+        self._worker.ilerleme.connect(lambda d,t:(self.progress.setValue(d),self.ilerleme_lbl.setText(f"{d}/{t}")))
         self._worker.bitti_signal.connect(self._bitti)
-        self._worker.start()
+        self._worker.start(); QTimer.singleShot(400,self.window().showMinimized)
+
 
     def _durdur(self):
         if self._worker: self._worker.dur()
         self.btn_dur.setEnabled(False)
 
-    def _bitti(self, res):
+    def _bitti(self,res):
         self.btn_excel.setEnabled(True); self.btn_pdf.setEnabled(True)
-        self.btn_dur.setEnabled(False)
-        self.progress.setValue(res["total"])
-        QMessageBox.information(self,"Tamamlandı",
+        self.btn_dur.setEnabled(False); self.progress.setValue(res["total"])
+        self.window().showNormal(); self.window().raise_(); self.window().activateWindow()
+        QMessageBox.information(self,"Tamamlandi",
             f"Toplam: {res['total']}\nBaşarı: {res['success']}\nHata: {res['failed']}")
 
 # ── Ana Pencere ───────────────────────────────────────────────────────────────
