@@ -3,10 +3,10 @@ SAP Suite v2 — Alan Tanıtma + Otomatik İndirici
 Dinamik sayfa grupları, eylem listesi, insan gibi mouse hareketi.
 
 Kurulum:
-    pip install PyQt6 pyautogui pyperclip openpyxl pandas opencv-python mss pillow
+    pip install PyQt6 pyautogui pyperclip openpyxl pandas opencv-python mss pillow psutil
 """
 
-import sys, json, os, time, subprocess, shutil, threading, math, random, base64
+import sys, json, os, time, subprocess, shutil, threading, math, random, base64, re
 from datetime import datetime
 from pathlib import Path
 
@@ -103,6 +103,7 @@ EYLEMLER = {
     "f5":             {"etiket": "F5  F5'e Bas",              "icon": "F5", "renk": "#e17055"},
     "fonksiyon_tusu": {"etiket": "Fn  Fonksiyon Tuşu",         "icon": "Fn", "renk": "#d63031"},
     "dosya_bekle":    {"etiket": "⬇  Dosya İnmesini Bekle", "icon": "⬇",  "renk": "#55efc4"},
+    "tus_ve_goruntu": {"etiket": "🔁  Tuşa Bas → Görüntü Bekle", "icon": "🔁", "renk": "#fd79a8"},
 }
 
 # Metin kaynakları (Metin Yaz eylemi için)
@@ -162,7 +163,6 @@ DEFAULT_CONFIG = {
 
 # ── Mail'den 2FA Kodu Oku (Outlook COM + IMAP) ───────────────────────────────
 def _kod_bul_regex(metin, regex):
-    import re
     eslesme = re.search(regex, metin, re.IGNORECASE)
     if not eslesme: return None
     try:    return eslesme.group(1)
@@ -310,8 +310,17 @@ def github_push(cfg, dosya_yolu=None):
 def load_config():
     if not CONFIG_FILE.exists():
         CONFIG_FILE.write_text(json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=False), encoding="utf-8")
-    try: cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    except: cfg = {}
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        # Bozuk config — sessizce yutma, yedekle ve kullanıcıya görünür yap
+        try:
+            yedek = CONFIG_FILE.with_suffix(f".bozuk_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+            shutil.copy(str(CONFIG_FILE), str(yedek))
+            print(f"[load_config] Bozuk config yedeklendi: {yedek}  ({e})")
+        except Exception:
+            pass
+        cfg = {}
     for k, v in DEFAULT_CONFIG.items(): cfg.setdefault(k, v)
     save_config(cfg); return cfg
 
@@ -353,28 +362,113 @@ def insan_gibi_tikla(x, y, cfg):
     except Exception:
         pass
 
-def sayfa_goruntu_bekle(goruntu_b64, timeout=12, esik=0.80):
-    if not goruntu_b64: return True
+def sayfa_goruntu_bekle(goruntu_b64, timeout=12, esik=0.80, log_cb=None):
+    """
+    Ekranda şablon görüntüyü arar, bulunca True döner.
+    log_cb: verilirse debug/hata mesajlarını loga yazar (None ise sessiz).
+    """
+    def _log(msg, level="INFO"):
+        if log_cb:
+            try: log_cb(msg, level)
+            except Exception: pass
+
+    if not goruntu_b64:
+        _log("  📷  Görüntü tanımsız → bekleme atlanıyor", "WARN")
+        return True   # tanımsızsa normal akışı kırma
+
     try:
         import base64
         arr = np.frombuffer(base64.b64decode(goruntu_b64), dtype=np.uint8)
-        sablon = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
-        if sablon is None: return True
+        sablon_orig = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+        if sablon_orig is None:
+            _log("  📷  Şablon decode edilemedi (base64 bozuk olabilir)", "ERROR")
+            return False   # YALAN söyleme — gerçekten başarısız
         import mss
+        with mss.mss() as sct:
+            _ilk = cv2.cvtColor(np.array(sct.grab(sct.monitors[1])), cv2.COLOR_BGRA2GRAY)
+        eh0, ew0 = _ilk.shape[:2]
+        sh0, sw0 = sablon_orig.shape[:2]
+        if sw0 > ew0 or sh0 > eh0:
+            oran = min(ew0 / sw0, eh0 / sh0) * 0.95
+            sablon = cv2.resize(sablon_orig, (int(sw0 * oran), int(sh0 * oran)))
+        else:
+            sablon = sablon_orig
+
+        en_yuksek_skor = 0.0
         bitis = time.time() + timeout
         while time.time() < bitis:
             with mss.mss() as sct:
                 ekran = cv2.cvtColor(np.array(sct.grab(sct.monitors[1])), cv2.COLOR_BGRA2GRAY)
-            sh,sw = sablon.shape[:2]; eh,ew = ekran.shape[:2]
-            if sw>ew or sh>eh:
-                oran=min(ew/sw,eh/sh)*0.95
-                sablon=cv2.resize(sablon,(int(sw*oran),int(sh*oran)))
-            _,max_val,_,_=cv2.minMaxLoc(cv2.matchTemplate(ekran,sablon,cv2.TM_CCOEFF_NORMED))
-            if max_val>=esik: return True
+            try:
+                _, max_val, _, _ = cv2.minMaxLoc(
+                    cv2.matchTemplate(ekran, sablon, cv2.TM_CCOEFF_NORMED)
+                )
+                if max_val > en_yuksek_skor:
+                    en_yuksek_skor = max_val
+                if max_val >= esik: return True
+            except cv2.error as ce:
+                _log(f"  📷  OpenCV hata: {ce}", "ERROR")
             time.sleep(0.3)
-    except Exception:
-        pass
+
+        # Timeout — en yüksek skor ne kadardı, kullanıcıya göster (eşiği ayarlaması için)
+        _log(
+            f"  📷  Görüntü bulunamadı — en yüksek benzerlik: {en_yuksek_skor:.2f} (eşik: {esik})",
+            "WARN"
+        )
+    except Exception as e:
+        _log(f"  📷  Bekleme hatası: {e}", "ERROR")
     return False
+
+def _bolge_goruntu_bekle(sablon_b64, bolge_rect, timeout=5, esik=0.80, log_cb=None):
+    """
+    Ekranın sadece bolge_rect=[x,y,w,h] bölgesini yakalayıp sablon_b64 ile karşılaştırır.
+    Eşleşme bulunursa ekran koordinatında (mx, my) merkez döndürür, bulunamazsa None.
+    """
+    def _log(msg, level="INFO"):
+        if log_cb:
+            try: log_cb(msg, level)
+            except Exception: pass
+
+    if not sablon_b64 or not bolge_rect: return None
+    try:
+        arr    = np.frombuffer(base64.b64decode(sablon_b64), dtype=np.uint8)
+        sablon = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+        if sablon is None:
+            _log("  🎯  Bölge şablonu decode edilemedi", "ERROR")
+            return None
+        import mss
+        bx, by, bw, bh = bolge_rect
+        mon   = {"left": bx, "top": by, "width": bw, "height": bh}
+        en_yuksek = 0.0
+        bitis = time.time() + timeout
+        while time.time() < bitis:
+            with mss.mss() as sct:
+                shot  = sct.grab(mon)
+                bolge = cv2.cvtColor(np.array(shot), cv2.COLOR_BGRA2GRAY)
+            sh, sw = sablon.shape[:2]; gh, gw = bolge.shape[:2]
+            if sw > gw or sh > gh:
+                oran   = min(gw / sw, gh / sh) * 0.95
+                sablon = cv2.resize(sablon, (int(sw * oran), int(sh * oran)))
+                sh, sw = sablon.shape[:2]
+            try:
+                sonuc = cv2.matchTemplate(bolge, sablon, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, max_loc = cv2.minMaxLoc(sonuc)
+                if max_val > en_yuksek: en_yuksek = max_val
+                if max_val >= esik:
+                    # Eşleşme merkezi → ekran koordinatına çevir
+                    mx = bx + max_loc[0] + sw // 2
+                    my = by + max_loc[1] + sh // 2
+                    return (mx, my)
+            except cv2.error as ce:
+                _log(f"  🎯  OpenCV hata: {ce}", "ERROR")
+            time.sleep(0.15)
+        _log(
+            f"  🎯  Bölgede bulunamadı — en yüksek benzerlik: {en_yuksek:.2f} (eşik: {esik})",
+            "WARN"
+        )
+    except Exception as e:
+        _log(f"  🎯  Bölge bekleme hatası: {e}", "ERROR")
+    return None
 
 def insan_gibi_yaz(metin, cfg):
     """Metni panoya kopyalayıp Ctrl+V ile yapıştır.
@@ -396,6 +490,7 @@ def insan_gibi_yaz(metin, cfg):
 class CanvasWidget(QLabel):
     alan_eklendi = pyqtSignal(dict)
     alan_secildi = pyqtSignal(int)
+    alan_tasindi = pyqtSignal(int, list, list)  # idx, yeni_rect, yeni_merkez
 
     def __init__(self):
         super().__init__()
@@ -412,6 +507,10 @@ class CanvasWidget(QLabel):
         self._gecici_rect = None
         self._cizim_modu = True
         self._secili_idx = -1
+        # Taşıma
+        self._tasima_aktif = False
+        self._tasima_basl_mouse = None
+        self._tasima_basl_rect  = None
 
     def goruntu_yukle(self, cv_img):
         self._pixmap_orig = cv_img.copy()
@@ -488,13 +587,22 @@ class CanvasWidget(QLabel):
             for i, alan in enumerate(self.alanlar):
                 r = alan["rect"]
                 if r[0] <= gp.x() <= r[0]+r[2] and r[1] <= gp.y() <= r[1]+r[3]:
-                    self._secili_idx = i; self.alan_secildi.emit(i); self.update(); return
-            self._secili_idx = -1; self.update()
+                    self._secili_idx = i
+                    self.alan_secildi.emit(i)
+                    self._tasima_aktif = True
+                    self._tasima_basl_mouse = gp
+                    self._tasima_basl_rect  = list(alan["rect"])
+                    self.setCursor(QCursor(Qt.CursorShape.SizeAllCursor))
+                    self.update(); return
+            self._secili_idx = -1
+            self._tasima_aktif = False
+            self.update()
 
     def mouseMoveEvent(self, ev):
-        if not self._cizim_modu or self._cizim_basl is None: return
+        if self._display_pm is None: return
         gp = self._w2g(ev.pos())
-        if gp:
+        if not gp: return
+        if self._cizim_modu and self._cizim_basl is not None:
             ox, oy = self._offset.x(), self._offset.y()
             x1 = ox+int(self._cizim_basl.x()*self._scale)
             y1 = oy+int(self._cizim_basl.y()*self._scale)
@@ -503,26 +611,52 @@ class CanvasWidget(QLabel):
                 abs(ev.pos().x()-x1), abs(ev.pos().y()-y1)
             )
             self.update()
+        elif not self._cizim_modu and self._tasima_aktif and self._secili_idx >= 0:
+            dx = gp.x() - self._tasima_basl_mouse.x()
+            dy = gp.y() - self._tasima_basl_mouse.y()
+            br = self._tasima_basl_rect
+            yeni_x = max(0, br[0] + dx)
+            yeni_y = max(0, br[1] + dy)
+            self.alanlar[self._secili_idx]["rect"]   = [yeni_x, yeni_y, br[2], br[3]]
+            self.alanlar[self._secili_idx]["merkez"] = [yeni_x + br[2]//2, yeni_y + br[3]//2]
+            self.update()
+        elif not self._cizim_modu:
+            uzerinde = any(
+                a["rect"][0] <= gp.x() <= a["rect"][0]+a["rect"][2] and
+                a["rect"][1] <= gp.y() <= a["rect"][1]+a["rect"][3]
+                for a in self.alanlar
+            )
+            self.setCursor(QCursor(Qt.CursorShape.SizeAllCursor if uzerinde else Qt.CursorShape.ArrowCursor))
 
     def mouseReleaseEvent(self, ev):
-        if ev.button() != Qt.MouseButton.LeftButton or not self._cizim_modu or self._cizim_basl is None: return
-        gp = self._w2g(ev.pos()); self._gecici_rect = None
-        if gp and self._cizim_basl:
-            x1, y1 = self._cizim_basl.x(), self._cizim_basl.y()
-            x2, y2 = gp.x(), gp.y()
-            w, h = abs(x2-x1), abs(y2-y1)
-            if w > 5 and h > 5:
-                alan = {
-                    "id": len(self.alanlar),
-                    "eylem": "sol_tikla",
-                    "rect": [min(x1,x2), min(y1,y2), w, h],
-                    "isim": f"Alan_{len(self.alanlar)+1}",
-                    "merkez": [min(x1,x2)+w//2, min(y1,y2)+h//2],
-                    "params": {}
-                }
-                self.alanlar.append(alan)
-                self.alan_eklendi.emit(alan)
-        self._cizim_basl = None; self.update()
+        if ev.button() != Qt.MouseButton.LeftButton: return
+        if self._cizim_modu and self._cizim_basl is not None:
+            gp = self._w2g(ev.pos()); self._gecici_rect = None
+            if gp and self._cizim_basl:
+                x1, y1 = self._cizim_basl.x(), self._cizim_basl.y()
+                x2, y2 = gp.x(), gp.y()
+                w, h = abs(x2-x1), abs(y2-y1)
+                if w > 5 and h > 5:
+                    alan = {
+                        "id": len(self.alanlar),
+                        "eylem": "sol_tikla",
+                        "rect": [min(x1,x2), min(y1,y2), w, h],
+                        "isim": f"Alan_{len(self.alanlar)+1}",
+                        "merkez": [min(x1,x2)+w//2, min(y1,y2)+h//2],
+                        "params": {}
+                    }
+                    self.alanlar.append(alan)
+                    self.alan_eklendi.emit(alan)
+            self._cizim_basl = None; self.update()
+        elif not self._cizim_modu and self._tasima_aktif:
+            if self._secili_idx >= 0:
+                alan = self.alanlar[self._secili_idx]
+                self.alan_tasindi.emit(self._secili_idx, list(alan["rect"]), list(alan["merkez"]))
+            self._tasima_aktif = False
+            self._tasima_basl_mouse = None
+            self._tasima_basl_rect  = None
+            self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+            self.update()
 
     def alan_sil(self, idx):
         if 0 <= idx < len(self.alanlar):
@@ -531,6 +665,7 @@ class CanvasWidget(QLabel):
     def hepsini_temizle(self): self.alanlar.clear(); self._secili_idx = -1; self.update()
     def mod_degistir(self, cizim):
         self._cizim_modu = cizim
+        self._tasima_aktif = False
         self.setCursor(QCursor(Qt.CursorShape.CrossCursor if cizim else Qt.CursorShape.ArrowCursor))
     def secili_idx(self): return self._secili_idx
     def sec(self, idx): self._secili_idx = idx; self.update()
@@ -647,6 +782,55 @@ class EylemSatiriWidget(QWidget):
             self.dosya_timeout.setValue(params.get("timeout",60)); self.dosya_timeout.setFixedWidth(70)
             self.param_lay.addWidget(self.dosya_timeout)
 
+        elif eylem == "tus_ve_goruntu":
+            # Tuş seçici
+            self.param_lay.addWidget(QLabel("Tuş:"))
+            self.tvg_tus = QLineEdit(params.get("tus","f5")); self.tvg_tus.setFixedWidth(50)
+            self.tvg_tus.setPlaceholderText("f5")
+            self.param_lay.addWidget(self.tvg_tus)
+            # Bekleme arası
+            self.param_lay.addWidget(QLabel("Tekrar(sn):"))
+            self.tvg_tekrar = QDoubleSpinBox(); self.tvg_tekrar.setRange(0.5,30.0)
+            self.tvg_tekrar.setSingleStep(0.5); self.tvg_tekrar.setFixedWidth(60)
+            self.tvg_tekrar.setValue(params.get("tekrar_sure",3.0))
+            self.param_lay.addWidget(self.tvg_tekrar)
+            # Max deneme
+            self.param_lay.addWidget(QLabel("Maks:"))
+            self.tvg_maks = QSpinBox(); self.tvg_maks.setRange(1,30)
+            self.tvg_maks.setValue(params.get("maks_deneme",10)); self.tvg_maks.setFixedWidth(50)
+            self.param_lay.addWidget(self.tvg_maks)
+            # Bölge + görüntü durumu
+            self.tvg_goruntu_b64  = params.get("goruntu_b64","")
+            self.tvg_bolge_b64    = params.get("bolge_b64","")
+            self.tvg_bolge_rect   = params.get("bolge_rect", None)  # [x,y,w,h] ekran koordinatı
+            # Durum etiketi: bölge mi tam ekran mı
+            _bolge_ok = bool(self.tvg_bolge_b64 and self.tvg_bolge_rect)
+            _tam_ok   = bool(self.tvg_goruntu_b64)
+            if _bolge_ok:
+                _lbl_txt = "🎯 Bölge Seçildi"; _lbl_clr = "#00d4aa"
+            elif _tam_ok:
+                _lbl_txt = "🖼 Tam Ekran";     _lbl_clr = "#ffa502"
+            else:
+                _lbl_txt = "Görüntü Yok";       _lbl_clr = "#ff4757"
+            self.tvg_goruntu_lbl = QLabel(_lbl_txt)
+            self.tvg_goruntu_lbl.setStyleSheet(f"color:{_lbl_clr};font-size:10px;")
+            self.param_lay.addWidget(self.tvg_goruntu_lbl)
+            # Bölge seç butonu (öncelikli — tavsiye edilen yöntem)
+            btn_bolge = QPushButton("🎯"); btn_bolge.setFixedSize(28,24)
+            btn_bolge.setToolTip("Ekran görüntüsü al → kritik bölgeyi çiz → sadece o bölgeyi izle (hızlı ve kesin)")
+            btn_bolge.clicked.connect(self._tvg_bolge_sec)
+            self.param_lay.addWidget(btn_bolge)
+            # Tam ekran butonu (yedek)
+            btn_goruntu = QPushButton("📷"); btn_goruntu.setFixedSize(28,24)
+            btn_goruntu.setToolTip("Tüm ekranı şablon olarak kaydet (yavaş, tavsiye edilmez)")
+            btn_goruntu.clicked.connect(self._tvg_goruntu_sec)
+            self.param_lay.addWidget(btn_goruntu)
+            # Eşleşince tıkla checkbox
+            self.tvg_tikla_chk = QCheckBox("Tıkla")
+            self.tvg_tikla_chk.setChecked(params.get("eslesince_tikla", False))
+            self.tvg_tikla_chk.setToolTip("Görüntü eşleşince bölgenin merkezine sol tıkla")
+            self.param_lay.addWidget(self.tvg_tikla_chk)
+
         else:
             lbl = QLabel("—"); lbl.setStyleSheet(f"color:{C['dim']};")
             self.param_lay.addWidget(lbl)
@@ -676,10 +860,253 @@ class EylemSatiriWidget(QWidget):
             params["url"] = self.chrome_url_edit.text().strip()
         elif eylem == "dosya_bekle":
             params["timeout"] = self.dosya_timeout.value()
+        elif eylem == "tus_ve_goruntu":
+            params["tus"]          = self.tvg_tus.text().strip().lower() if hasattr(self,"tvg_tus") else "f5"
+            params["tekrar_sure"]  = self.tvg_tekrar.value() if hasattr(self,"tvg_tekrar") else 3.0
+            params["maks_deneme"]  = self.tvg_maks.value() if hasattr(self,"tvg_maks") else 10
+            params["goruntu_b64"]  = self.tvg_goruntu_b64 if hasattr(self,"tvg_goruntu_b64") else ""
+            params["bolge_b64"]    = self.tvg_bolge_b64   if hasattr(self,"tvg_bolge_b64")   else ""
+            params["bolge_rect"]   = self.tvg_bolge_rect  if hasattr(self,"tvg_bolge_rect")  else None
+            params["eslesince_tikla"] = self.tvg_tikla_chk.isChecked() if hasattr(self,"tvg_tikla_chk") else False
         return {"eylem": eylem, "params": params}
+
+    def _tvg_goruntu_sec(self):
+        """📷 Tam ekran şablon — menü aç (Dosyadan Seç / Ekran Al)."""
+        menu = QMenu(self)
+        menu.addAction("📂  Dosyadan Seç", self._tvg_dosyadan_sec)
+        menu.addAction("🖥  Tüm Ekranı Al (yedek)", self._tvg_ekrandan_sec)
+        menu.exec(self.cursor().pos())
+
+    def _tvg_bolge_sec(self):
+        """🎯 Bölge seç — ekran görüntüsü al, BolgeSecimDlg ile kritik bölgeyi çiz."""
+        ust_pencere = self.window()
+        # Tüm dialog ve ana pencereleri gizle
+        gizlenen_dialoglar = []
+        for w in QApplication.topLevelWidgets():
+            if isinstance(w, QDialog) and w.isVisible():
+                w.hide(); gizlenen_dialoglar.append(w)
+        # Ana QMainWindow'u da bul ve minimize et (Chrome görünsün)
+        ana_pencere = None
+        for w in QApplication.topLevelWidgets():
+            if isinstance(w, QMainWindow):
+                ana_pencere = w; w.showMinimized(); break
+        if ana_pencere is None:
+            ust_pencere.hide()
+        # 700ms sonra ekran görüntüsü al ve BolgeSecimDlg'yi aç
+        QTimer.singleShot(
+            700,
+            lambda: self._tvg_bolge_yakala(ana_pencere, ust_pencere, gizlenen_dialoglar)
+        )
+
+    def _tvg_bolge_yakala(self, ana_pencere, ust_pencere, gizlenen_dialoglar):
+        """Ekran görüntüsü al, sonra BolgeSecimDlg'yi aç."""
+        tam_ekran = None
+        try:
+            import mss
+            with mss.mss() as sct:
+                shot = sct.grab(sct.monitors[1])
+                tam_ekran = cv2.cvtColor(np.array(shot), cv2.COLOR_BGRA2BGR)
+        except Exception as e:
+            QMessageBox.warning(ust_pencere, "Hata", f"Ekran alınamadı:\n{e}")
+
+        # Pencereleri geri getir (BolgeSecimDlg bunların üstünde açılacak)
+        if ana_pencere is not None:
+            ana_pencere.showNormal()
+        else:
+            ust_pencere.show()
+        for d in gizlenen_dialoglar:
+            d.show()
+
+        if tam_ekran is None:
+            return
+
+        # Bölge seçim dialogu aç
+        dlg = BolgeSecimDlg(tam_ekran, ust_pencere)
+        if dlg.exec():
+            rect, bolge_img = dlg.secili_bolge()
+            if bolge_img is not None and bolge_img.size > 0:
+                # Sadece seçilen bölgeyi şablon olarak kaydet
+                ok, buf = cv2.imencode(".png", bolge_img)
+                if ok:
+                    self.tvg_bolge_b64  = base64.b64encode(buf.tobytes()).decode("utf-8")
+                    self.tvg_bolge_rect = rect  # [x, y, w, h] ekran koordinatı
+                    # Tam ekranı da yedek olarak tut (fallback için)
+                    ok2, buf2 = cv2.imencode(".png", tam_ekran)
+                    if ok2:
+                        self.tvg_goruntu_b64 = base64.b64encode(buf2.tobytes()).decode("utf-8")
+                    self.tvg_goruntu_lbl.setText("🎯 Bölge Seçildi")
+                    self.tvg_goruntu_lbl.setStyleSheet("color:#00d4aa;font-size:10px;")
+
+    def _tvg_dosyadan_sec(self):
+        yol,_ = QFileDialog.getOpenFileName(self,"Görüntü Seç","","Görüntüler (*.png *.jpg *.jpeg *.bmp)")
+        if not yol: return
+        img = cv2.imread(yol)
+        if img is None:
+            QMessageBox.warning(self, "Hata", "Görüntü okunamadı."); return
+        ok, buf = cv2.imencode(".png", img)
+        if ok:
+            self.tvg_goruntu_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+            self.tvg_bolge_b64   = ""      # dosya seçilince bölge modunu sıfırla
+            self.tvg_bolge_rect  = None
+            self.tvg_goruntu_lbl.setText("🖼 Tam Ekran")
+            self.tvg_goruntu_lbl.setStyleSheet("color:#ffa502;font-size:10px;")
+
+    def _tvg_ekrandan_sec(self):
+        """Tüm ekranı (yedek mod) şablon olarak kaydet — pencereleri gizle."""
+        ust_pencere = self.window()
+        gizlenen_dialoglar = []
+        for w in QApplication.topLevelWidgets():
+            if isinstance(w, QDialog) and w.isVisible():
+                w.hide(); gizlenen_dialoglar.append(w)
+        ana_pencere = None
+        for w in QApplication.topLevelWidgets():
+            if isinstance(w, QMainWindow):
+                ana_pencere = w; w.showMinimized(); break
+        if ana_pencere is None:
+            ust_pencere.hide()
+        QTimer.singleShot(
+            700,
+            lambda: self._tvg_ekran_yakala(ana_pencere, ust_pencere, gizlenen_dialoglar)
+        )
+
+    def _tvg_ekran_yakala(self, ana_pencere, ust_pencere, gizlenen_dialoglar):
+        try:
+            import mss
+            with mss.mss() as sct:
+                shot = sct.grab(sct.monitors[1])
+                img = cv2.cvtColor(np.array(shot), cv2.COLOR_BGRA2BGR)
+            ok, buf = cv2.imencode(".png", img)
+            if ok:
+                self.tvg_goruntu_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+                self.tvg_bolge_b64   = ""     # tam ekran modunda bölgeyi sıfırla
+                self.tvg_bolge_rect  = None
+                self.tvg_goruntu_lbl.setText("🖼 Tam Ekran")
+                self.tvg_goruntu_lbl.setStyleSheet("color:#ffa502;font-size:10px;")
+            else:
+                QMessageBox.warning(ust_pencere, "Hata", "Görüntü kodlanamadı")
+        except Exception as e:
+            QMessageBox.warning(ust_pencere, "Hata", f"Ekran görüntüsü alınamadı:\n{e}")
+        finally:
+            if ana_pencere is not None:
+                ana_pencere.showNormal()
+            else:
+                ust_pencere.show()
+            for d in gizlenen_dialoglar:
+                d.show()
 
     def set_sirano(self, n):
         self.sirano_lbl.setText(f"{n}.")
+
+
+# ── Bölge Seçim Diyalogu (tus_ve_goruntu için) ───────────────────────────────
+class BolgeSecimDlg(QDialog):
+    """
+    Tam ekran görüntüsü üzerinde kullanıcının dikdörtgen çizmesini sağlar.
+    Sadece seçilen bölge izleme şablonu olarak kaydedilir.
+    """
+    def __init__(self, cv_img, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Kritik Bölgeyi Çiz — İzlenecek Alan")
+        self.setStyleSheet(SS)
+        self._cv_img   = cv_img
+        self._rect     = None
+        self._basl     = None
+        self._scale    = 1.0
+        self._offset_x = 0
+        self._offset_y = 0
+        self._kur()
+
+    def _kur(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8,8,8,8); lay.setSpacing(6)
+
+        bilgi = QLabel("🎯  İzlenecek kritik bölgeyi çiz  (örn: sayfa başlığı, buton, durum yazısı)")
+        bilgi.setStyleSheet(f"color:{C['accent']};font-size:11px;font-weight:bold;")
+        lay.addWidget(bilgi)
+
+        self._lbl = QLabel()
+        self._lbl.setMinimumSize(900, 540)
+        self._lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._lbl.setCursor(QCursor(Qt.CursorShape.CrossCursor))
+        self._lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl.mousePressEvent   = self._mouse_press
+        self._lbl.mouseMoveEvent    = self._mouse_move
+        self._lbl.mouseReleaseEvent = self._mouse_release
+        lay.addWidget(self._lbl)
+
+        self._durum_lbl = QLabel("Sol tık basılı tut → sürükle → bırak")
+        self._durum_lbl.setStyleSheet(f"color:{C['dim']};font-size:10px;")
+        lay.addWidget(self._durum_lbl)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("✓  Bu Bölgeyi Kullan")
+        bb.button(QDialogButtonBox.StandardButton.Ok).setObjectName("accent")
+        bb.accepted.connect(self._kabul)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+        self._pixmap_guncelle()
+
+    def _pixmap_guncelle(self, gecici_rect=None):
+        img = self._cv_img.copy()
+        if self._rect:
+            x,y,w,h = self._rect
+            cv2.rectangle(img, (x,y), (x+w,y+h), (0,212,170), 3)
+        if gecici_rect:
+            x1,y1,x2,y2 = gecici_rect
+            cv2.rectangle(img, (min(x1,x2),min(y1,y2)), (max(x1,x2),max(y1,y2)), (255,165,0), 2)
+        h, w = img.shape[:2]
+        lw, lh = self._lbl.width() or 900, self._lbl.height() or 540
+        scale = min(lw/w, lh/h, 1.0)
+        self._scale    = scale
+        self._offset_x = int((lw - w*scale)//2)
+        self._offset_y = int((lh - h*scale)//2)
+        dw, dh = int(w*scale), int(h*scale)
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        rgb = np.ascontiguousarray(rgb)
+        qimg = QImage(rgb.data, w, h, w*3, QImage.Format.Format_RGB888)
+        pm = QPixmap.fromImage(qimg).scaled(
+            dw, dh, Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        )
+        self._lbl.setPixmap(pm)
+
+    def _lbl2img(self, pos):
+        ix = int((pos.x() - self._offset_x) / self._scale)
+        iy = int((pos.y() - self._offset_y) / self._scale)
+        h, w = self._cv_img.shape[:2]
+        return max(0, min(ix, w-1)), max(0, min(iy, h-1))
+
+    def _mouse_press(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self._basl = self._lbl2img(ev.pos())
+
+    def _mouse_move(self, ev):
+        if self._basl:
+            bitis = self._lbl2img(ev.pos())
+            self._pixmap_guncelle(gecici_rect=(*self._basl, *bitis))
+
+    def _mouse_release(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton and self._basl:
+            bitis = self._lbl2img(ev.pos())
+            x1,y1 = self._basl; x2,y2 = bitis
+            x,y,w,h = min(x1,x2), min(y1,y2), abs(x2-x1), abs(y2-y1)
+            if w > 10 and h > 10:
+                self._rect = [x, y, w, h]
+                self._durum_lbl.setText(f"✓ Bölge: X={x} Y={y}  {w}×{h}px  — OK ile onayla")
+                self._durum_lbl.setStyleSheet(f"color:{C['accent']};font-size:10px;font-weight:bold;")
+            self._basl = None
+            self._pixmap_guncelle()
+
+    def _kabul(self):
+        if not self._rect:
+            QMessageBox.warning(self, "Uyarı", "Önce bir bölge çizin!"); return
+        self.accept()
+
+    def secili_bolge(self):
+        if not self._rect: return None, None
+        x,y,w,h = self._rect
+        return self._rect, self._cv_img[y:y+h, x:x+w]
 
 
 # ── Eylem Zinciri Diyalogu ────────────────────────────────────────────────────
@@ -905,7 +1332,7 @@ class AkisAgaci(QTreeWidget):
         param_ozet = self._zincir_param_str(zincir)
 
         child = QTreeWidgetItem(sayfa_item, [
-            f"  {alan_verisi['isim']}",
+            f"  {alan_verisi.get('isim','?')}",
             eylem_ozet,
             param_ozet
         ])
@@ -1187,6 +1614,7 @@ class AlanTanitmaSekmesi(QWidget):
         self.canvas = CanvasWidget()
         self.canvas.alan_eklendi.connect(self._alan_eklendi)
         self.canvas.alan_secildi.connect(self._canvas_alan_secildi)
+        self.canvas.alan_tasindi.connect(self._canvas_alan_tasindi)
         frame = QFrame(); frame.setObjectName("canvas_frame")
         fl = QVBoxLayout(frame); fl.setContentsMargins(4,4,4,4); fl.addWidget(self.canvas)
         ov.addWidget(frame)
@@ -1213,6 +1641,9 @@ class AlanTanitmaSekmesi(QWidget):
             tb = QHBoxLayout(); tb.setSpacing(4)
             bs = QPushButton("➕ Sayfa"); bs.setFixedHeight(28)
             bs.clicked.connect(self._yeni_sayfa); tb.addWidget(bs)
+            be = QPushButton("⚡ Eylem Ekle"); be.setFixedHeight(28)
+            be.setToolTip("Alan çizmeden doğrudan sayfaya eylem ekle (F5, Enter, Bekle vb.)")
+            be.clicked.connect(self._koordinatsiz_eylem_ekle); tb.addWidget(be)
             bu = QPushButton("⬆"); bu.setFixedSize(28,28)
             bu.clicked.connect(self._adim_yukari); tb.addWidget(bu)
             bd = QPushButton("⬇"); bd.setFixedSize(28,28)
@@ -1259,7 +1690,8 @@ class AlanTanitmaSekmesi(QWidget):
         QTimer.singleShot(600, self._ekran_yakala_icin_sayfa)
 
     def _ekran_yakala_icin_sayfa(self):
-        hedef = self.akis_agaci._ekran_goruntu_hedef
+        hedef_agac = self._aktif_agac()          # hangi sekme aktifse onu kullan
+        hedef = hedef_agac._ekran_goruntu_hedef
         try:
             import mss
             with mss.mss() as sct:
@@ -1268,14 +1700,14 @@ class AlanTanitmaSekmesi(QWidget):
             self._cv_img = cv_img
             self.canvas.goruntu_yukle(cv_img)
             if hedef is not None:
-                b64 = self._aktif_agac()._cv_to_b64(cv_img)
-                self._aktif_agac()._sayfa_goruntu_guncelle(hedef, b64)
+                b64 = hedef_agac._cv_to_b64(cv_img)
+                hedef_agac._sayfa_goruntu_guncelle(hedef, b64)
                 isim = hedef.data(0, Qt.ItemDataRole.UserRole).get("isim","")
                 self.aktif_sayfa_lbl.setText(f"→ {isim} 🖼")
         except Exception as e:
             QMessageBox.warning(self, "Hata", str(e))
         finally:
-            self.akis_agaci._ekran_goruntu_hedef = None
+            hedef_agac._ekran_goruntu_hedef = None
             self.window().show()
 
     def _aktif_sayfa_goruntu_guncelle(self):
@@ -1288,10 +1720,13 @@ class AlanTanitmaSekmesi(QWidget):
 
     def _dosya_ac(self):
         yol,_ = QFileDialog.getOpenFileName(self,"Görüntü Aç","","Görüntüler (*.png *.jpg *.jpeg *.bmp)")
-        if yol:
-            self._cv_img = cv2.imread(yol)
-            self.canvas.goruntu_yukle(self._cv_img)
-            self._aktif_sayfa_goruntu_guncelle()
+        if not yol: return
+        img = cv2.imread(yol)
+        if img is None:
+            QMessageBox.warning(self, "Hata", f"Görüntü okunamadı:\n{yol}"); return
+        self._cv_img = img
+        self.canvas.goruntu_yukle(self._cv_img)
+        self._aktif_sayfa_goruntu_guncelle()
 
     def _ekran_al(self):
         self.window().hide(); QTimer.singleShot(600, self._ekran_yakala)
@@ -1357,6 +1792,27 @@ class AlanTanitmaSekmesi(QWidget):
                 f"Merkez: ({m[0]},{m[1]})"
             )
 
+    def _koordinatsiz_eylem_ekle(self):
+        """Alan çizmeden doğrudan sayfaya eylem ekle (F5, Enter, Bekle vb.)"""
+        agac = self._aktif_agac()
+        if self._aktif_sayfa_item is None:
+            if agac.topLevelItemCount() == 0:
+                QMessageBox.warning(self, "Uyarı", "Önce bir sayfa grubu oluşturun!"); return
+            self._aktif_sayfa_item = agac.topLevelItem(agac.topLevelItemCount() - 1)
+        alan = {
+            "id": -1,
+            "eylem": "f5",
+            "rect": [0, 0, 0, 0],
+            "isim": "Eylem",
+            "merkez": [0, 0],
+            "params": {}
+        }
+        dlg = EylemDialog(alan, self)
+        if dlg.exec():
+            sonuc = dlg.get_sonuc()
+            alan.update(sonuc)
+            agac.adim_ekle(alan, self._aktif_sayfa_item)
+
     def _alan_eklendi(self, alan):
         # Eylem diyalogu aç
         dlg = EylemDialog(alan, self)
@@ -1373,6 +1829,23 @@ class AlanTanitmaSekmesi(QWidget):
 
     def _canvas_alan_secildi(self, idx):
         pass  # ağaçta highlight yapılabilir, şimdilik boş
+
+    def _canvas_alan_tasindi(self, canvas_idx, yeni_rect, yeni_merkez):
+        """Canvas'ta alan taşındığında ağaçtaki koordinatları güncelle."""
+        if self._aktif_sayfa_item is None: return
+        agac = self._aktif_agac()
+        if 0 <= canvas_idx < self._aktif_sayfa_item.childCount():
+            child = self._aktif_sayfa_item.child(canvas_idx)
+            veri = child.data(0, Qt.ItemDataRole.UserRole) or {}
+            veri["rect"]   = yeni_rect
+            veri["merkez"] = yeni_merkez
+            child.setData(0, Qt.ItemDataRole.UserRole, veri)
+            agac.degisti.emit()
+        self.koor_lbl.setText(
+            f"Taşındı → X:{yeni_rect[0]} Y:{yeni_rect[1]}  G:{yeni_rect[2]} Y:{yeni_rect[3]}\n"
+            f"Merkez: ({yeni_merkez[0]},{yeni_merkez[1]})"
+        )
+
 
     def _aktif_agac(self):
         idx = self.akis_tab.currentIndex() if hasattr(self, "akis_tab") else 0
@@ -1422,12 +1895,15 @@ class AlanTanitmaSekmesi(QWidget):
         varsayilan = self.cfg.get(cfg_key, str(APP_DIR/f"sap_akis_{mod}.json"))
         yol,_ = QFileDialog.getSaveFileName(self,f"{etiket} Akis JSON Kaydet",varsayilan,"JSON (*.json)")
         if yol:
-            Path(yol).write_text(
-                json.dumps({"sayfalar":sayfalar,"sayi":len(sayfalar)}, ensure_ascii=False, indent=2),
-                encoding="utf-8"
-            )
-            self.cfg[cfg_key] = yol; save_config(self.cfg)
-            QMessageBox.information(self,"OK",f"{etiket} akisi kaydedildi:\n{yol}")
+            try:
+                Path(yol).write_text(
+                    json.dumps({"sayfalar":sayfalar,"sayi":len(sayfalar)}, ensure_ascii=False, indent=2),
+                    encoding="utf-8"
+                )
+                self.cfg[cfg_key] = yol; save_config(self.cfg)
+                QMessageBox.information(self,"OK",f"{etiket} akisi kaydedildi:\n{yol}")
+            except Exception as e:
+                QMessageBox.critical(self, "Kayıt Hatası", f"JSON yazılamadı:\n{e}")
 
     def _json_yukle(self):
         mod    = "pdf" if self.akis_tab.currentIndex() == 1 else "excel"
@@ -1437,11 +1913,36 @@ class AlanTanitmaSekmesi(QWidget):
         if not yol: return
         try:
             veri = json.loads(Path(yol).read_text(encoding="utf-8"))
-            self._aktif_agac().akis_yukle(veri.get("sayfalar",[]))
+            agac = self._aktif_agac()
+            agac.akis_yukle(veri.get("sayfalar",[]))
             self.cfg[cfg_key] = yol; save_config(self.cfg)
+
+            # İlk sayfayı otomatik seç ve canvas'a yükle
+            self._aktif_sayfa_item = None
+            self.canvas.hepsini_temizle()
+            if agac.topLevelItemCount() > 0:
+                ilk_sayfa = agac.topLevelItem(0)
+                self._aktif_sayfa_item = ilk_sayfa
+                agac.setCurrentItem(ilk_sayfa)
+                sayfa_veri = ilk_sayfa.data(0, Qt.ItemDataRole.UserRole) or {}
+                isim = sayfa_veri.get("isim","")
+                b64  = sayfa_veri.get("goruntu_b64","")
+                suffix = " 🖼" if b64 else ""
+                self.aktif_sayfa_lbl.setText(f"→ {isim}{suffix}")
+                if b64:
+                    cv_img = agac.b64_to_cv(b64)
+                    if cv_img is not None:
+                        self._cv_img = cv_img
+                        self.canvas.goruntu_yukle(cv_img)
+                        for j in range(ilk_sayfa.childCount()):
+                            adim_veri = ilk_sayfa.child(j).data(0, Qt.ItemDataRole.UserRole) or {}
+                            self.canvas.alanlar.append(adim_veri)
+                        self.canvas.update()
+
             QMessageBox.information(self,"OK",f"{etiket} akisi yuklendi.")
         except Exception as e:
-            QMessageBox.critical(self,"Hata",str(e))
+            import traceback
+            QMessageBox.critical(self,"Hata", f"{e}\n\n{traceback.format_exc()}")
 
     def _github_push(self):
         try:
@@ -1458,6 +1959,273 @@ class AlanTanitmaSekmesi(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "GitHub Hata", f"Beklenmeyen hata:\n{e}")
 
+# ── Gözcü (Watchdog) — Uzun çalışmada sistemi izler ───────────────────────────
+class Gozcu(QThread):
+    """
+    Saatlerce çalışan worker'ı izleyen ajan.
+    Her 30 saniyede bir kontrol eder:
+      🧠 RAM: süreç RAM'i belirli bir eşiği aştı mı?
+      💀 Donma: worker 5 dakikadır aktivite vermiyor mu?
+      💥 Ardışık hata: üst üste 5 sipariş fail oldu mu?
+      🌐 Chrome: chrome.exe process'i yaşıyor mu?
+
+    Seviyeler:
+      INFO   → log
+      WARN   → log + overlay uyarısı (kırmızı)
+      KRITIK → log + overlay + worker.dur()
+    """
+    uyari_signal = pyqtSignal(str, str)   # (seviye, mesaj)
+    kritik_durdur = pyqtSignal(str)       # (sebep)
+
+    # Eşikler (config'ten de alınabilir ama default makul)
+    RAM_ESIK_MB           = 1500          # 1.5 GB → WARN
+    RAM_KRITIK_MB         = 2500          # 2.5 GB → KRITIK
+    DONMA_SN              = 300           # 5 dakika sessizlik → WARN
+    DONMA_KRITIK_SN       = 600           # 10 dakika sessizlik → KRITIK (durdur)
+    ARDISIK_HATA_ESIK     = 5             # 5 fail üst üste → KRITIK
+    KONTROL_ARALIGI_SN    = 30
+
+    def __init__(self, worker, parent=None):
+        super().__init__(parent)
+        self._worker = worker
+        self._dur_event = threading.Event()
+        self._psutil = None
+        self._son_ram_uyarisi = 0          # spam önleme: aynı uyarıyı sık gönderme
+        self._son_chrome_uyarisi = 0
+        try:
+            import psutil
+            self._psutil = psutil
+        except ImportError:
+            pass
+
+    def dur(self): self._dur_event.set()
+
+    def run(self):
+        # İlk kontrol için 10 sn bekle (worker ısınsın)
+        if self._dur_event.wait(10): return
+        while not self._dur_event.is_set():
+            try:
+                self._kontrol_et()
+            except Exception as e:
+                # Gözcü kendisi crash olmasın, sadece log
+                self.uyari_signal.emit("INFO", f"Gözcü hatası (önemsiz): {e}")
+            # Bir sonraki kontrole kadar bekle — dur() çağırılırsa hemen çık
+            if self._dur_event.wait(self.KONTROL_ARALIGI_SN): break
+
+    def _kontrol_et(self):
+        if self._worker is None or not self._worker.isRunning():
+            return
+
+        simdi = time.time()
+
+        # ── 1) Donma tespiti ─────────────────────────────────────────────────
+        son_aktivite = getattr(self._worker, "_son_aktivite", simdi)
+        sessizlik = simdi - son_aktivite
+        if sessizlik > self.DONMA_KRITIK_SN:
+            self.kritik_durdur.emit(
+                f"Worker {int(sessizlik/60)} dakikadır sessiz — donmuş olabilir, durduruluyor"
+            )
+            return
+        elif sessizlik > self.DONMA_SN:
+            self.uyari_signal.emit("WARN",
+                f"💀  Worker {int(sessizlik)}sn sessiz — Chrome donmuş olabilir")
+
+        # ── 2) Ardışık hata ──────────────────────────────────────────────────
+        ardisik = getattr(self._worker, "_ardisik_hata", 0)
+        if ardisik >= self.ARDISIK_HATA_ESIK:
+            self.kritik_durdur.emit(
+                f"{ardisik} sipariş üst üste başarısız — SAP veya Chrome sorunlu, durduruluyor"
+            )
+            return
+
+        # ── 3) RAM kontrolü (psutil varsa) ───────────────────────────────────
+        if self._psutil:
+            try:
+                proc = self._psutil.Process(os.getpid())
+                ram_mb = proc.memory_info().rss / (1024 * 1024)
+                if ram_mb > self.RAM_KRITIK_MB:
+                    self.kritik_durdur.emit(
+                        f"RAM {ram_mb:.0f} MB'a ulaştı ({self.RAM_KRITIK_MB}+) — bellek sızıntısı, durduruluyor"
+                    )
+                    return
+                elif ram_mb > self.RAM_ESIK_MB:
+                    # 5 dakikada bir uyarı (spam önleme)
+                    if simdi - self._son_ram_uyarisi > 300:
+                        self.uyari_signal.emit("WARN",
+                            f"🧠  RAM: {ram_mb:.0f} MB (eşik {self.RAM_ESIK_MB})")
+                        self._son_ram_uyarisi = simdi
+            except Exception:
+                pass
+
+            # ── 4) Chrome process kontrolü ───────────────────────────────────
+            chrome_var = False
+            try:
+                for p in self._psutil.process_iter(["name"]):
+                    try:
+                        ad = (p.info.get("name") or "").lower()
+                        if "chrome" in ad:
+                            chrome_var = True; break
+                    except (self._psutil.NoSuchProcess, self._psutil.AccessDenied):
+                        continue
+            except Exception:
+                chrome_var = True  # kontrol başarısızsa varsayım: yaşıyor
+            if not chrome_var:
+                # 2 dakikada bir uyar (Chrome her an açılabilir)
+                if simdi - self._son_chrome_uyarisi > 120:
+                    self.uyari_signal.emit("WARN",
+                        "🌐  Chrome process bulunamadı — tarayıcı kapanmış olabilir")
+                    self._son_chrome_uyarisi = simdi
+
+
+
+# ── Floating Overlay (Chrome önde iken üstte açılan bilgi çubuğu) ─────────────
+class FloatingOverlay(QWidget):
+    """
+    Program arka planda çalışırken (Chrome önde), ekranın üst-ortasında
+    her zaman görünür olan, odak çalmayan şeffaf bilgi çubuğu.
+    Sürüklenebilir, × ile gizlenebilir.
+    """
+
+    def __init__(self, toplam: int, parent=None):
+        flags = (
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.Tool |
+            Qt.WindowType.FramelessWindowHint
+        )
+        super().__init__(parent, flags)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setWindowFlag(Qt.WindowType.WindowDoesNotAcceptFocus, True)
+
+        self._toplam     = toplam
+        self._tamamlandi = 0
+        self._baslama    = time.time()
+        self._surukle    = None          # sürükleme başlangıç noktası
+
+        self._kur()
+        self._konumlandir()
+
+    # ── UI kurulumu ──────────────────────────────────────────────────────────
+    def _kur(self):
+        self.setFixedSize(400, 96)
+        ana = QVBoxLayout(self)
+        ana.setContentsMargins(14, 8, 14, 8)
+        ana.setSpacing(5)
+
+        # ── Başlık satırı ──────────────────────────────────────────────────
+        ust = QHBoxLayout()
+        ic  = QLabel("⚙  SAP İndirici — Çalışıyor")
+        ic.setStyleSheet(
+            f"color:{C['accent']};font-weight:bold;font-size:11px;background:transparent;"
+        )
+        ust.addWidget(ic)
+        ust.addStretch()
+        btn_x = QPushButton("×")
+        btn_x.setFixedSize(20, 20)
+        btn_x.setStyleSheet(
+            f"QPushButton{{background:transparent;color:{C['dim']};border:none;"
+            f"font-size:16px;font-weight:bold;padding:0;}}"
+            f"QPushButton:hover{{color:{C['danger']};}}"
+        )
+        btn_x.clicked.connect(self.hide)
+        ust.addWidget(btn_x)
+        ana.addLayout(ust)
+
+        # ── İlerleme satırı ────────────────────────────────────────────────
+        self.ilerleme_lbl = QLabel("⏳  Başlatılıyor…")
+        self.ilerleme_lbl.setStyleSheet(
+            f"color:{C['text']};font-size:13px;font-weight:bold;background:transparent;"
+        )
+        ana.addWidget(self.ilerleme_lbl)
+
+        # ── ETA satırı ─────────────────────────────────────────────────────
+        self.eta_lbl = QLabel("⏱  Süre hesaplanıyor…")
+        self.eta_lbl.setStyleSheet(
+            f"color:{C['dim']};font-size:11px;background:transparent;"
+        )
+        ana.addWidget(self.eta_lbl)
+
+    # ── Ekranın üst-ortasına yerleştir ──────────────────────────────────────
+    def _konumlandir(self):
+        try:
+            ekran = QApplication.primaryScreen().availableGeometry()
+        except Exception:
+            ekran = QApplication.primaryScreen().geometry()
+        self.move((ekran.width() - self.width()) // 2, 16)
+
+    # ── Arka planı elle çiz (yarı-saydam yuvarlak kutu) ──────────────────────
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QColor(18, 22, 34, 224))           # koyu, hafif şeffaf
+        p.setPen(QPen(QColor(C["accent"]), 1.5))
+        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 10, 10)
+        p.end()
+
+    # ── Sürükleme ─────────────────────────────────────────────────────────────
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self._surukle = ev.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, ev):
+        if self._surukle and ev.buttons() == Qt.MouseButton.LeftButton:
+            self.move(ev.globalPosition().toPoint() - self._surukle)
+
+    def mouseReleaseEvent(self, ev):
+        self._surukle = None
+
+    # ── Sinyal bağlantısı: ilerleme güncellemesi ─────────────────────────────
+    def guncelle(self, tamamlandi: int, toplam: int):
+        self._tamamlandi = tamamlandi
+        self._toplam     = toplam
+        kalan = max(0, toplam - tamamlandi)    # negatif olmasını engelle
+
+        self.ilerleme_lbl.setText(
+            f"📥  {tamamlandi} / {toplam} tamamlandı  —  {kalan} dosya kaldı"
+        )
+
+        gecen = time.time() - self._baslama
+        if tamamlandi > 0 and kalan > 0 and gecen > 0:
+            ort_sure      = gecen / tamamlandi          # sipariş başına ortalama süre
+            kalan_sure    = kalan * ort_sure
+            bitis_ts      = time.time() + kalan_sure
+            try:
+                bitis_str = datetime.fromtimestamp(bitis_ts).strftime("%H:%M")
+            except (ValueError, OSError, OverflowError):
+                bitis_str = "—"
+            kalan_dk      = int(kalan_sure // 60)
+            kalan_sn      = int(kalan_sure % 60)
+            self.eta_lbl.setText(
+                f"⏱  Tahmini bitiş: {bitis_str}  "
+                f"(yaklaşık {kalan_dk} dk {kalan_sn} sn)"
+            )
+        elif kalan == 0:
+            self.eta_lbl.setText("✅  Son sipariş işleniyor…")
+        # tamamlandi==0 durumunda "Başlatılıyor…" mesajı kalır (ilk açılış)
+
+        if not self.isVisible():
+            self.show()
+
+    # ── Gözcü uyarısı göster (4sn sonra kendini sıfırlar) ────────────────────
+    def uyari_goster(self, mesaj: str, seviye: str = "WARN"):
+        """Gözcü'den gelen uyarıları overlay'de kırmızı olarak göster."""
+        renk = C['danger'] if seviye in ("WARN", "KRITIK") else C['warn']
+        self.eta_lbl.setText(f"⚠  {mesaj}")
+        self.eta_lbl.setStyleSheet(
+            f"color:{renk};font-size:11px;font-weight:bold;background:transparent;"
+        )
+        # 6 saniye sonra normal renge dön
+        QTimer.singleShot(6000, self._uyari_sifirla)
+
+    def _uyari_sifirla(self):
+        try:
+            self.eta_lbl.setStyleSheet(
+                f"color:{C['dim']};font-size:11px;background:transparent;"
+            )
+        except Exception:
+            pass
+
+
 # ── İndirici Worker ───────────────────────────────────────────────────────────
 class IndiriciWorker(QThread):
     log_signal   = pyqtSignal(str)
@@ -1469,17 +2237,28 @@ class IndiriciWorker(QThread):
         self.cfg = cfg
         self.sayfalar = sayfalar  # akış JSON'dan gelen sayfa listesi
         self.numbers = numbers
-        self._dur = False
+        self._dur_event = threading.Event()   # thread-safe dur flag
         self._aktif_numara = "dosya"
         self._son_dosya = None
+        # ── Gözcü takip alanları ─────────────────────────────────────────────
+        self._son_aktivite = time.time()       # donma tespiti için
+        self._ardisik_hata = 0                  # ardışık fail sayacı
 
-    def dur(self): self._dur = True
+    def dur(self): self._dur_event.set()
+
+    @property
+    def _dur(self): return self._dur_event.is_set()
+
+    def _aktivite_bildir(self):
+        """Gözcü'ye 'yaşıyorum' sinyali."""
+        self._son_aktivite = time.time()
 
     def log(self, msg, level="INFO"):
         icons = {"INFO":"·","OK":"✓","WARN":"⚠","ERROR":"✗"}
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {icons.get(level,'·')} {msg}"
         self.log_signal.emit(line)
+        self._son_aktivite = time.time()   # Gözcü için heartbeat
         try:
             with open(LOG_FILE,"a",encoding="utf-8") as f: f.write(line+"\n")
         except: pass
@@ -1609,8 +2388,8 @@ class IndiriciWorker(QThread):
                     self.log(f"  📧  Kod alındı: {kod}","OK")
                     pyautogui.click(x, y); time.sleep(0.3)
                     pyautogui.hotkey("ctrl","a"); time.sleep(0.1)
-                    pyautogui.typewrite(kod, interval=0.1)
-                    time.sleep(0.3)
+                    pyperclip.copy(str(kod))             # typewrite() yerine — ASCII sorunu yok
+                    pyautogui.hotkey("ctrl","v"); time.sleep(0.2)
                 else:
                     self.log("  📧  Mail kodu 60sn'de gelmedi!","WARN")
 
@@ -1635,7 +2414,14 @@ class IndiriciWorker(QThread):
                     yeniler=[indir_klas/ad for ad,boyut in simdi.items()
                              if ad not in onceki and not ad.endswith((".crdownload",".tmp",".part")) and boyut>0]
                     if not yeniler: continue
-                    kaynak=max(yeniler,key=lambda p:p.stat().st_mtime); uzanti=kaynak.suffix.lower()
+                    # stat() dosya silinmişse/kilitliyse OSError fırlatabilir → filtrele
+                    yeniler = [p for p in yeniler if p.exists()]
+                    if not yeniler: continue
+                    try:
+                        kaynak=max(yeniler,key=lambda p:p.stat().st_mtime)
+                    except OSError:
+                        continue
+                    uzanti=kaynak.suffix.lower()
                     self.log(f"  ⬇  Bulunan: {kaynak.name}")
                     hedef=dl_dir_local/f"{numara}{uzanti}"; n=2
                     while hedef.exists(): hedef=dl_dir_local/f"{numara}_{n}{uzanti}"; n+=1
@@ -1649,6 +2435,76 @@ class IndiriciWorker(QThread):
                 if not bulundu and not self._dur:
                     self.log(f"  ⬇  {timeout}sn icinde dosya gelmedi!","ERROR")
 
+            elif eylem == "tus_ve_goruntu":
+                tus          = params.get("tus","f5").lower()
+                tekrar_sure  = float(params.get("tekrar_sure", 3.0))
+                maks_deneme  = int(params.get("maks_deneme", 10))
+                goruntu_b64  = params.get("goruntu_b64","")
+                bolge_b64    = params.get("bolge_b64","")
+                bolge_rect   = params.get("bolge_rect", None)   # [x,y,w,h]
+                esik         = float(cfg.get("ekran_bekleme_esik", 0.80))
+                eslesince_tikla = bool(params.get("eslesince_tikla", False))
+
+                # Kullanılacak şablon ve izleme modu
+                _sablon_b64  = bolge_b64 if bolge_b64 else goruntu_b64
+                _bolge_modu  = bool(bolge_b64 and bolge_rect)
+
+                if not _sablon_b64:
+                    self.log(f"  🔁  [{tus.upper()}] Görüntü tanımlanmamış, sadece tuşa basılıyor","WARN")
+                    pyautogui.press(tus)
+                else:
+                    mod_str = f"🎯 bölge {bolge_rect}" if _bolge_modu else "🖼 tam ekran"
+                    self.log(
+                        f"  🔁  [{tus.upper()}] Başladı → maks {maks_deneme} deneme, "
+                        f"her denemede {tekrar_sure}sn bekle, mod: {mod_str} (eşik {esik:.2f})"
+                    )
+
+                    def _goruntu_eslesdi():
+                        """Eşleşme bulunursa (x,y) konum döndür, bulunamazsa None."""
+                        if _bolge_modu:
+                            return _bolge_goruntu_bekle(
+                                _sablon_b64, bolge_rect,
+                                timeout=tekrar_sure, esik=esik, log_cb=self.log
+                            )
+                        else:
+                            ok = sayfa_goruntu_bekle(
+                                _sablon_b64,
+                                timeout=tekrar_sure, esik=esik, log_cb=self.log
+                            )
+                            return (0, 0) if ok else None
+
+                    def _eslesince_isle(konum):
+                        if eslesince_tikla and konum and konum != (0, 0):
+                            tx, ty = konum
+                            self.log(f"  🖱  Eşleşme konumuna tıklanıyor ({tx},{ty})")
+                            time.sleep(random.uniform(0.1, 0.2))
+                            insan_gibi_tikla(tx, ty, cfg)
+
+                    bulundu = False
+                    for deneme in range(1, maks_deneme + 1):
+                        if self._dur: break
+                        # ── 1. Adım: Önce bekle, görüntü geldi mi? ─────────
+                        self.log(f"  🔁  [{tus.upper()}] Deneme {deneme}/{maks_deneme} — önce bekle")
+                        konum = _goruntu_eslesdi()
+                        if konum is not None:
+                            self.log(f"  🔁  Görüntü geldi, devam ediliyor","OK")
+                            bulundu = True
+                            _eslesince_isle(konum)
+                            break
+                        # ── 2. Adım: Görüntü gelmedi → tuşa bas → tekrar bekle
+                        self.log(f"  🔁  Görüntü gelmedi → {tus.upper()} basılıyor")
+                        pyautogui.press(tus)
+                        time.sleep(0.5)   # tuştan sonra sayfa değişimi için bekle
+                        konum = _goruntu_eslesdi()
+                        if konum is not None:
+                            self.log(f"  🔁  {tus.upper()} sonrası görüntü geldi","OK")
+                            bulundu = True
+                            _eslesince_isle(konum)
+                            break
+                        else:
+                            self.log(f"  🔁  {tus.upper()} sonrası da görüntü gelmedi, tekrar deneniyor")
+                    if not bulundu and not self._dur:
+                        self.log(f"  🔁  {maks_deneme} denemede görüntü gelmedi!","ERROR")
 
             return True
         except Exception as e:
@@ -1658,11 +2514,22 @@ class IndiriciWorker(QThread):
             return False
 
     def run(self):
+        res = {"total":len(self.numbers),"success":0,"failed":0,"files":[],"errors":[]}
+        try:
+            self._run_safe(res)
+        except Exception as e:
+            import traceback
+            self.log(f"KRITIK HATA: {e}","ERROR")
+            self.log(traceback.format_exc(),"ERROR")
+        finally:
+            # bitti_signal HER DURUMDA emit edilmeli — aksi halde UI butonları kilitli kalır
+            self.bitti_signal.emit(res)
+
+    def _run_safe(self, res):
         import pyautogui
         pyautogui.FAILSAFE = False
         cfg = self.cfg
         dl_dir = Path(cfg["download_folder"]); dl_dir.mkdir(parents=True, exist_ok=True)
-        res = {"total":len(self.numbers),"success":0,"failed":0,"files":[],"errors":[]}
 
         # Chrome aç ve URL'ye git artık akış JSON'dan yönetiliyor
         self.log("Akış başlatılıyor...")
@@ -1707,7 +2574,7 @@ class IndiriciWorker(QThread):
                 time.sleep(random.uniform(0.1, 0.3))
 
         if self._dur:
-            self.log("DURDURULDU","WARN"); self.bitti_signal.emit(res); return
+            self.log("DURDURULDU","WARN"); return
 
         # 2FA kontrolü
         if cfg.get("2fa_gerekli", False):
@@ -1715,17 +2582,22 @@ class IndiriciWorker(QThread):
             kod = mail_den_kod_oku(cfg, timeout=60)
             if kod:
                 self.log(f"2FA kodu alindi: {kod}","OK")
-                import pyautogui
+                _2fa_girildi = False
                 for sayfa in giris_sayfalar:
+                    if _2fa_girildi: break
                     for adim in sayfa.get("adimlar",[]):
                         if "2fa" in adim.get("isim","").lower():
                             m = adim.get("merkez",[0,0])
                             pyautogui.click(m[0], m[1]); time.sleep(0.3)
                             pyautogui.hotkey("ctrl","a"); time.sleep(0.1)
-                            pyautogui.typewrite(kod, interval=0.1)
-                            time.sleep(0.3); pyautogui.press("enter")
+                            import pyperclip
+                            pyperclip.copy(str(kod))
+                            pyautogui.hotkey("ctrl","v"); time.sleep(0.2)
+                            pyautogui.press("enter")
                             self.log("2FA kodu girildi","OK")
-                            time.sleep(3); break
+                            time.sleep(3)
+                            _2fa_girildi = True
+                            break
             else:
                 self.log("2FA kodu 60sn icinde gelmedi — manuel girin","WARN")
                 time.sleep(10)
@@ -1734,7 +2606,6 @@ class IndiriciWorker(QThread):
         for i, numara in enumerate(self.numbers, 1):
             if self._dur: self.log("DURDURULDU","WARN"); break
             self.log(f"─── [{i}/{len(self.numbers)}] Sipariş: {numara} ───")
-            self.ilerleme.emit(i, len(self.numbers))
             self._aktif_numara = str(numara)  # dosya_bekle için sipariş numarasını güncelle
             basarili = False
 
@@ -1746,8 +2617,6 @@ class IndiriciWorker(QThread):
                 try:
                     # Her deneme başında dosya takibini sıfırla
                     self._son_dosya = None
-                    # Dosya sayısını kaydet (download takibi)
-                    onceki = set((Path.home()/"Downloads").glob("Spreadsheet_*.xlsx"))
 
                     for sayfa in siparis_sayfalar:
                         if self._dur: break
@@ -1793,6 +2662,12 @@ class IndiriciWorker(QThread):
 
             if not basarili:
                 res["failed"]+=1; res["errors"].append(numara)
+                self._ardisik_hata += 1              # Gözcü için sayaç
+            else:
+                self._ardisik_hata = 0                # başarılı → sıfırla
+
+            # İlerleme — sipariş bittikten sonra sinyal gönder (başında değil)
+            self.ilerleme.emit(i, len(self.numbers))
 
             # ── Döngü Sonu sayfaları (her siparişten sonra) ──────────────────
             if dongu_sonu_sayfalar and not self._dur:
@@ -1819,7 +2694,7 @@ class IndiriciWorker(QThread):
 
         self.log("─── TAMAMLANDI ───")
         self.log(f"Toplam:{res['total']}  Başarı:{res['success']}  Hata:{res['failed']}")
-        self.bitti_signal.emit(res)
+        # bitti_signal finally bloğunda emit ediliyor
 
 # ── Sekme 2: Otomatik İndirici ────────────────────────────────────────────────
 class IsYeriFiltreDlg(QDialog):
@@ -1908,6 +2783,9 @@ class IndiriciSekmesi(QWidget):
         super().__init__()
         self.cfg = cfg
         self._worker = None
+        self._worker_prev = None
+        self._overlay = None
+        self._gozcu = None
         self._kur()
 
     def _kur(self):
@@ -2117,6 +2995,9 @@ class IndiriciSekmesi(QWidget):
         return i-1
     def _excel_oku_filtreli(self,dosya_yolu):
         import pandas as pd
+        # NOT: numara_baslangic_satir config'i var ama şu anda kullanılmıyor.
+        # Kullanıcının mevcut Excel kurulumunu bozmamak için header=0 sabit bırakıldı.
+        # Gelecekte UI'da açıkça "Başlık satırı" seçimi gerekirse şuraya bağlanabilir.
         df=pd.read_excel(dosya_yolu,sheet_name=self.sheet_spin.value(),header=0,dtype=str)
         df.dropna(how="all",inplace=True)
         siparis_col=df.iloc[:,self._col_idx(self.sutun_edit.text().strip().upper() or "C")]
@@ -2145,16 +3026,17 @@ class IndiriciSekmesi(QWidget):
             if benzersiz is None: return
             if not benzersiz:
                 QMessageBox.warning(self,"Bos","Secili is yerlerinde siparis bulunamadi!"); return
-            dl_dir=self.pdf_dl_edit.text().strip() if mod=="pdf" else self.dl_edit.text().strip()
+            # pdf_dl_edit widget'ı oluşturulmadı — config'ten oku
+            if mod == "pdf":
+                dl_dir = self.cfg.get("pdf_download_folder","").strip()
+            else:
+                dl_dir = self.dl_edit.text().strip()
             HaftalikOnizlemeDlg(benzersiz,dosya_yolu,dl_dir,self).exec()
         except Exception as e:
             QMessageBox.critical(self,"Hata",f"Excel okunamadi:\n{e}")
     def _sec_dl(self):
         x=QFileDialog.getExistingDirectory(self,"Excel Indirme",self.dl_edit.text())
         if x: self.dl_edit.setText(x)
-    def _sec_pdf_dl(self):
-        x=QFileDialog.getExistingDirectory(self,"PDF Indirme",self.pdf_dl_edit.text())
-        if x: self.pdf_dl_edit.setText(x)
 
     def _mail_test(self):
         """Outlook bağlantısını test et — alt klasörü de kontrol eder."""
@@ -2282,18 +3164,66 @@ class IndiriciSekmesi(QWidget):
         self.btn_excel.setEnabled(False); self.btn_pdf.setEnabled(False); self.btn_dur.setEnabled(True)
         cfg_w=dict(self.cfg)
         if mod=="pdf" and dl_dir: cfg_w["download_folder"]=dl_dir
+        # Hâlâ çalışan worker varsa YENİ worker oluşturmadan ÖNCE durdur
+        # (normalde buton disabled olur ama programatik çağrıya karşı koruma)
+        for w_attr in ("_worker", "_worker_prev"):
+            w = getattr(self, w_attr, None)
+            if w and w.isRunning():
+                w.dur(); w.wait(3000)
+        self._worker_prev = None
         self._worker=IndiriciWorker(cfg_w,sayfalar,numbers)
         self._worker.log_signal.connect(self._log)
-        self._worker.ilerleme.connect(lambda d,t:(self.progress.setValue(d),self.ilerleme_lbl.setText(f"{d}/{t}")))
+        self._worker.ilerleme.connect(self._ilerleme_guncelle)
         self._worker.bitti_signal.connect(self._bitti)
+        # ── FloatingOverlay — Chrome önde iken üstte görünen bilgi çubuğu ──
+        self._overlay = FloatingOverlay(len(numbers))
+        self._overlay.show()
+        # ── Gözcü — uzun çalışmada sistemi izle ──────────────────────────
+        self._gozcu = Gozcu(self._worker)
+        self._gozcu.uyari_signal.connect(self._gozcu_uyari)
+        self._gozcu.kritik_durdur.connect(self._gozcu_kritik)
+        self._gozcu.start()
         self._worker.start(); QTimer.singleShot(400,self.window().showMinimized)
 
+
+    def _gozcu_uyari(self, seviye: str, mesaj: str):
+        """Gözcü'den gelen normal uyarı — log + overlay kırmızı."""
+        self._log(f"[GÖZCÜ/{seviye}] {mesaj}")
+        if self._overlay:
+            self._overlay.uyari_goster(mesaj, seviye)
+
+    def _gozcu_kritik(self, sebep: str):
+        """Gözcü'den gelen KRİTİK uyarı — worker'ı durdur."""
+        self._log(f"[GÖZCÜ/KRITIK] {sebep}")
+        if self._overlay:
+            self._overlay.uyari_goster(sebep, "KRITIK")
+        if self._worker and self._worker.isRunning():
+            self._worker.dur()
+
+    def _ilerleme_guncelle(self, tamamlandi: int, toplam: int):
+        """İlerleme çubuğu + FloatingOverlay'i aynı anda günceller."""
+        self.progress.setValue(tamamlandi)
+        self.ilerleme_lbl.setText(f"{tamamlandi}/{toplam}")
+        if hasattr(self, "_overlay") and self._overlay:
+            self._overlay.guncelle(tamamlandi, toplam)
 
     def _durdur(self):
         if self._worker: self._worker.dur()
         self.btn_dur.setEnabled(False)
+        # Overlay ve Gözcü'yü kapat
+        if hasattr(self, "_overlay") and self._overlay:
+            self._overlay.hide(); self._overlay = None
+        if hasattr(self, "_gozcu") and self._gozcu:
+            self._gozcu.dur(); self._gozcu = None
 
-    def _bitti(self,res):
+    def _bitti(self, res):
+        # Overlay ve Gözcü'yü kapat
+        if hasattr(self, "_overlay") and self._overlay:
+            self._overlay.hide(); self._overlay = None
+        if hasattr(self, "_gozcu") and self._gozcu:
+            self._gozcu.dur(); self._gozcu = None
+        self._worker_prev = self._worker   # GC için referansı sakla
+        self._worker = None
         self.btn_excel.setEnabled(True); self.btn_pdf.setEnabled(True)
         self.btn_dur.setEnabled(False); self.progress.setValue(res["total"])
         self.window().showNormal(); self.window().raise_(); self.window().activateWindow()
@@ -2370,7 +3300,24 @@ class SAPSuite(QMainWindow):
         QTimer.singleShot(800, self._f9_yakala)
 
     def closeEvent(self, event):
-        """Pencere kapanınca keyboard hook'u temizle."""
+        """Pencere kapanınca keyboard hook'u, worker thread'i ve gözcü'yü temizle."""
+        # 1) Worker thread çalışıyorsa durdur — aksi halde Chrome'u karıştırmaya devam eder
+        try:
+            worker = getattr(self.indirici_tab, "_worker", None)
+            if worker and worker.isRunning():
+                worker.dur()
+                worker.wait(5000)   # 5sn bekle, ardından zorla bırak
+        except Exception:
+            pass
+        # 2) Gözcü'yü durdur
+        try:
+            gozcu = getattr(self.indirici_tab, "_gozcu", None)
+            if gozcu and gozcu.isRunning():
+                gozcu.dur()
+                gozcu.wait(2000)
+        except Exception:
+            pass
+        # 3) pynput dinleyiciyi durdur
         try:
             if hasattr(self, '_pynput_listener'):
                 self._pynput_listener.stop()
